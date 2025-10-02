@@ -21,6 +21,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <queue>
+#include <cerrno>
 
 #include "./readFile.h"
 
@@ -343,6 +344,8 @@ vector<SeederInfo> parseFileInfo(const string& response, long long& fileSize, ve
 int connectToPeer(const string& ipAddr, int port) {
     int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (sock_fd < 0) {
+        // Use perror to print system error messages
+        perror("Failed to create peer socket");
         return -1;
     }
 
@@ -353,10 +356,15 @@ int connectToPeer(const string& ipAddr, int port) {
     peer_addr.sin_port = htons(port);
 
     if (connect(sock_fd, (struct sockaddr*)&peer_addr, sizeof(peer_addr)) < 0) {
+        // Print which peer we failed to connect to and why
+        cout << "[DEBUG] Failed to connect to peer " << ipAddr << ":" << port << ". Reason: ";
+        perror(""); // perror will print the last system error, e.g., "Connection refused"
         close(sock_fd);
         return -1;
     }
 
+    // Optional: Print a success message for debugging
+    // cout << "[DEBUG] Successfully connected to peer " << ipAddr << ":" << port << endl;
     return sock_fd;
 }
 
@@ -428,87 +436,112 @@ bool downloadPieceFromPeer(const string& ipAddr, int port, const string& groupId
     return true;
 }
 
-void downloadWorker(int workerId, const vector<SeederInfo>& seeders, 
-                   const string& groupId, const string& fileName, 
+void downloadWorker(int workerId, const vector<SeederInfo>& seeders,
+                   const string& groupId, const string& fileName,
                    const string& destPath, TaskQueue& taskQueue,
                    DownloadInfo* dInfo, atomic<int>& downloadedCount,
                    atomic<int>& failedCount) {
-    
-    int seederIndex = workerId % seeders.size();
-    
+
+    // Each worker is assigned a primary seeder based on its ID for round-robin distribution.
+    int primarySeederIndex = workerId % seeders.size();
+
     while (true) {
         DownloadTask task;
+        // Exit the worker thread if the task queue is empty and marked as done.
         if (!taskQueue.pop(task)) {
             break;
         }
-        
+
         bool downloaded = false;
         int attempts = 0;
         const int MAX_ATTEMPTS = 3;
-        
+        const SeederInfo* successfulSeeder = nullptr;
+
         while (!downloaded && attempts < MAX_ATTEMPTS) {
-            for (size_t i = 0; i < seeders.size() && !downloaded; i++) {
-                int currentSeederIdx = (seederIndex + i) % seeders.size();
-                const SeederInfo& seeder = seeders[currentSeederIdx];
-                
-                if (task.pieceIndex < (int)seeder.availablePieces.size() && 
-                    seeder.availablePieces[task.pieceIndex]) {
-                    
-                    if (downloadPieceFromPeer(seeder.ipAddr, seeder.port, groupId, 
-                                             fileName, task.pieceIndex, destPath, 
-                                             task.expectedHash)) {
-                        downloaded = true;
-                        downloadedCount++;
-                        
-                        {
-                            lock_guard<mutex> lock(downloadMutex);
-                            dInfo->piecesDownloaded[task.pieceIndex] = true;
-                        }
-                        
-                        {
-                            lock_guard<mutex> lock(consoleMutex);
-                            cout << "[DOWNLOAD] Worker " << workerId 
-                                 << " downloaded piece " << task.pieceIndex + 1 
-                                 << "/" << dInfo->totalPieces 
-                                 << " from " << seeder.userId 
-                                 << " (" << seeder.ipAddr << ":" << seeder.port << ")" << endl;
+            // Step 1: Attempt to download from the worker's primary assigned seeder.
+            const SeederInfo& primarySeeder = seeders[primarySeederIndex];
+            if (task.pieceIndex < (int)primarySeeder.availablePieces.size() &&
+                primarySeeder.availablePieces[task.pieceIndex]) {
+
+                if (downloadPieceFromPeer(primarySeeder.ipAddr, primarySeeder.port, groupId,
+                                         fileName, task.pieceIndex, destPath,
+                                         task.expectedHash)) {
+                    downloaded = true;
+                    successfulSeeder = &primarySeeder;
+                }
+            }
+
+            // Step 2: If the primary seeder failed, try other seeders as a fallback.
+            if (!downloaded) {
+                for (size_t i = 0; i < seeders.size(); i++) {
+                    // Skip the primary seeder since we already tried it.
+                    if (i == primarySeederIndex) continue;
+
+                    const SeederInfo& fallbackSeeder = seeders[i];
+                    if (task.pieceIndex < (int)fallbackSeeder.availablePieces.size() &&
+                        fallbackSeeder.availablePieces[task.pieceIndex]) {
+
+                        if (downloadPieceFromPeer(fallbackSeeder.ipAddr, fallbackSeeder.port, groupId,
+                                                 fileName, task.pieceIndex, destPath,
+                                                 task.expectedHash)) {
+                            downloaded = true;
+                            successfulSeeder = &fallbackSeeder;
+                            break; // Exit fallback loop on success.
                         }
                     }
                 }
             }
-            
+
+            // Step 3: If still not downloaded, increment attempts and wait before retrying.
             if (!downloaded) {
-                attempts++;
-                if (attempts < MAX_ATTEMPTS) {
+                 attempts++;
+                 if (attempts < MAX_ATTEMPTS) {
                     lock_guard<mutex> lock(consoleMutex);
-                    cout << "[DOWNLOAD] Worker " << workerId 
-                         << " retrying piece " << task.pieceIndex 
+                    cout << "[DOWNLOAD] Worker " << workerId
+                         << " retrying piece " << task.pieceIndex
                          << " (attempt " << attempts + 1 << ")" << endl;
-                    this_thread::sleep_for(chrono::milliseconds(100));
+                    this_thread::sleep_for(chrono::milliseconds(200));
                 }
             }
         }
-        
-        if (!downloaded) {
+
+        // After all attempts, process the result.
+        if (downloaded) {
+            downloadedCount++;
+            {
+                lock_guard<mutex> lock(downloadMutex);
+                dInfo->piecesDownloaded[task.pieceIndex] = true;
+            }
+
+            {
+                // Print success message including which seeder was used.
+                lock_guard<mutex> lock(consoleMutex);
+                cout << "[DOWNLOAD] Worker " << workerId
+                     << " downloaded piece " << task.pieceIndex + 1
+                     << "/" << dInfo->totalPieces
+                     << " from " << seeders[workerId].userId
+                     << " (" << seeders[workerId].ipAddr << ":" << seeders[workerId].port << ")" 
+                     << endl;
+            }
+        } else {
+            // Print failure message if the piece could not be downloaded.
             failedCount++;
             lock_guard<mutex> lock(consoleMutex);
-            cout << "[DOWNLOAD] Worker " << workerId 
-                 << " FAILED to download piece " << task.pieceIndex 
+            cout << "[DOWNLOAD] Worker " << workerId
+                 << " FAILED to download piece " << task.pieceIndex
                  << " after " << MAX_ATTEMPTS << " attempts" << endl;
         }
-        
-        seederIndex = (seederIndex + 1) % seeders.size();
     }
 }
 
 void downloadFileThread(string groupId, string fileName, string destPath) {
     string key = groupId + ":" + fileName;
-    
+
     string cmd = "get_file_info " + groupId + " " + fileName;
     sendToTracker(cmd);
-    
+
     string response = receiveFromTracker();
-    
+
     if (response.find("ERROR") != string::npos) {
         lock_guard<mutex> lock(consoleMutex);
         cout << response << endl;
@@ -518,6 +551,25 @@ void downloadFileThread(string groupId, string fileName, string destPath) {
     long long fileSize;
     vector<string> pieceHashes;
     vector<SeederInfo> seeders = parseFileInfo(response, fileSize, pieceHashes);
+
+    // ===================================================================
+    // NEW DEBUG BLOCK TO PRINT SEEDER LIST
+    // ===================================================================
+    {
+        lock_guard<mutex> lock(consoleMutex);
+        cout << "[DEBUG] Tracker provided the following seeders:" << endl;
+        if (seeders.empty()) {
+            cout << "[DEBUG]   -> No seeders found." << endl;
+        } else {
+            for (size_t i = 0; i < seeders.size(); ++i) {
+                cout << "[DEBUG]   -> Seeder #" << i << ": User='" << seeders[i].userId
+                     << "', Address='" << seeders[i].ipAddr << ":" << seeders[i].port << "'" << endl;
+            }
+        }
+    }
+    // ===================================================================
+    // END OF NEW DEBUG BLOCK
+    // ===================================================================
 
     if (seeders.empty()) {
         lock_guard<mutex> lock(consoleMutex);
@@ -542,7 +594,7 @@ void downloadFileThread(string groupId, string fileName, string destPath) {
 
     {
         lock_guard<mutex> lock(consoleMutex);
-        cout << "[DOWNLOAD] Starting download of " << fileName 
+        cout << "[DOWNLOAD] Starting download of " << fileName
              << " (" << dInfo.totalPieces << " pieces)" << endl;
         cout << "[DOWNLOAD] Available seeders: " << seeders.size() << endl;
     }
@@ -560,7 +612,7 @@ void downloadFileThread(string groupId, string fileName, string destPath) {
     vector<thread> workers;
     atomic<int> downloadedCount(0);
     atomic<int> failedCount(0);
-    
+
     {
         lock_guard<mutex> lock(consoleMutex);
         cout << "[DOWNLOAD] Spawning " << numWorkers << " worker threads" << endl;
@@ -573,8 +625,8 @@ void downloadFileThread(string groupId, string fileName, string destPath) {
     }
 
     for (int i = 0; i < numWorkers; i++) {
-        workers.emplace_back(downloadWorker, i, ref(seeders), groupId, fileName, 
-                           destPath, ref(taskQueue), dInfoPtr, 
+        workers.emplace_back(downloadWorker, i, ref(seeders), groupId, fileName,
+                           destPath, ref(taskQueue), dInfoPtr,
                            ref(downloadedCount), ref(failedCount));
     }
 
@@ -590,7 +642,7 @@ void downloadFileThread(string groupId, string fileName, string destPath) {
             lock_guard<mutex> lock(downloadMutex);
             activeDownloads[key].isComplete = true;
         }
-        
+
         {
             lock_guard<mutex> lock(consoleMutex);
             cout << "[C] [" << groupId << "] " << fileName << endl;
@@ -605,12 +657,11 @@ void downloadFileThread(string groupId, string fileName, string destPath) {
         receiveFromTracker();
     } else {
         lock_guard<mutex> lock(consoleMutex);
-        cout << "[DOWNLOAD] Incomplete download of " << fileName 
-             << " (" << downloadedCount << "/" << dInfo.totalPieces 
+        cout << "[DOWNLOAD] Incomplete download of " << fileName
+             << " (" << downloadedCount << "/" << dInfo.totalPieces
              << " pieces, " << failedCount << " failed)" << endl;
     }
 }
-
 void handleDownloadFile(const vector<string>& tokens) {
     if (tokens.size() != 4) {
         cout << "Usage: download_file <group_id> <file_name> <destination_path>\n";
@@ -682,12 +733,16 @@ void servePiece(int clientSock, const string& groupId, const string& fileName, i
         return;
     }
 
-    int fd = open(dInfo.destPath.c_str(), O_RDONLY);
-    if (fd < 0) {
-        string error = "ERROR:Cannot open file\n";
-        send(clientSock, error.c_str(), error.size(), 0);
-        return;
-    }
+   int fd = open(dInfo.destPath.c_str(), O_RDONLY);
+if (fd < 0) {
+    // These lines will print to the SEEDER's console
+    cout << "[DEBUG seeder] Could not open file path: '" << dInfo.destPath << "'" << endl;
+    perror("[DEBUG seeder] Reason"); // This prints the system error, e.g., "No such file or directory"
+
+    string error = "ERROR:Cannot open file\n";
+    send(clientSock, error.c_str(), error.size(), 0);
+    return;
+}
 
     lseek(fd, (long long)pieceIndex * PIECE_SIZE, SEEK_SET);
     
