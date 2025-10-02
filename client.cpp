@@ -18,6 +18,9 @@
 #include <unordered_map>
 #include <algorithm>
 #include <arpa/inet.h>
+#include <atomic>
+#include <condition_variable>
+#include <queue>
 
 #include "./readFile.h"
 
@@ -50,7 +53,53 @@ struct SeederInfo {
     vector<bool> availablePieces;
 };
 
+struct DownloadTask {
+    int pieceIndex;
+    string expectedHash;
+    int attemptCount;
+};
+
 unordered_map<string, DownloadInfo> activeDownloads; // key: groupId:fileName
+
+// Thread-safe task queue
+class TaskQueue {
+private:
+    queue<DownloadTask> tasks;
+    mutex queueMutex;
+    condition_variable cv;
+    bool done;
+    
+public:
+    TaskQueue() : done(false) {}
+    
+    void push(const DownloadTask& task) {
+        lock_guard<mutex> lock(queueMutex);
+        tasks.push(task);
+        cv.notify_one();
+    }
+    
+    bool pop(DownloadTask& task) {
+        unique_lock<mutex> lock(queueMutex);
+        cv.wait(lock, [this] { return !tasks.empty() || done; });
+        
+        if (tasks.empty()) return false;
+        
+        task = tasks.front();
+        tasks.pop();
+        return true;
+    }
+    
+    void setDone() {
+        lock_guard<mutex> lock(queueMutex);
+        done = true;
+        cv.notify_all();
+    }
+    
+    bool isEmpty() {
+        lock_guard<mutex> lock(queueMutex);
+        return tasks.empty();
+    }
+};
 
 int connectToTracker(string hostname, vector<vector<string>> ports) {
     for (auto ip_port : ports) {
@@ -147,7 +196,6 @@ void sendToTracker(const string& message) {
         ssize_t totalSent = 0;
         ssize_t msgLen = msg.size();
         
-        // Send the entire message, handling partial sends
         while (totalSent < msgLen) {
             ssize_t sent = send(trackerSock, msg.c_str() + totalSent, msgLen - totalSent, 0);
             if (sent <= 0) {
@@ -163,7 +211,6 @@ string receiveFromTracker() {
     char buffer[8192];
     string result = "";
     
-    // Keep reading until we get a complete line (ends with newline)
     while (true) {
         bzero(buffer, sizeof(buffer));
         int n = read(trackerSock, buffer, sizeof(buffer) - 1);
@@ -176,13 +223,11 @@ string receiveFromTracker() {
         
         result.append(buffer, n);
         
-        // Check if we got a complete message (ends with newline)
         if (result.find('\n') != string::npos) {
             break;
         }
     }
     
-    // Remove trailing newline
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
     }
@@ -199,7 +244,6 @@ void handleUploadFile(const vector<string>& tokens) {
     string groupId = tokens[1];
     string filePath = tokens[2];
 
-    // Check if file exists
     struct stat fileStat;
     if (stat(filePath.c_str(), &fileStat) != 0) {
         cout << "File does not exist: " << filePath << endl;
@@ -208,7 +252,6 @@ void handleUploadFile(const vector<string>& tokens) {
 
     long long fileSize = fileStat.st_size;
     
-    // Extract filename from path
     string fileName = filePath;
     size_t lastSlash = filePath.find_last_of("/\\");
     if (lastSlash != string::npos) {
@@ -217,10 +260,8 @@ void handleUploadFile(const vector<string>& tokens) {
 
     cout << "Calculating hashes for file: " << fileName << " (" << fileSize << " bytes)...\n";
 
-    // Calculate piece hashes
     vector<string> pieceHashes = calculatePieceHashes(filePath);
     
-    // Combine all hashes into single string
     string combinedHashes = "";
     for (size_t i = 0; i < pieceHashes.size(); i++) {
         combinedHashes += pieceHashes[i];
@@ -229,7 +270,6 @@ void handleUploadFile(const vector<string>& tokens) {
         }
     }
 
-    // Send to tracker
     string cmd = "upload_file " + groupId + " " + fileName + " " + to_string(fileSize) + " " + combinedHashes;
     sendToTracker(cmd);
     
@@ -237,7 +277,6 @@ void handleUploadFile(const vector<string>& tokens) {
     cout << response << endl;
 
     if (response.find("successfully") != string::npos) {
-        // Store local file info for serving
         string key = groupId + ":" + fileName;
         DownloadInfo dInfo;
         dInfo.groupId = groupId;
@@ -270,18 +309,14 @@ void handleListFiles(const vector<string>& tokens) {
 vector<SeederInfo> parseFileInfo(const string& response, long long& fileSize, vector<string>& pieceHashes) {
     vector<SeederInfo> seeders;
     
-    // Format: FILEINFO|filesize|hash1,hash2,...|seeder1:ip:port:bitmap;seeder2:ip:port:bitmap;...
     vector<string> parts = split(response, '|');
     if (parts.size() < 4 || parts[0] != "FILEINFO") {
         return seeders;
     }
 
     fileSize = stoll(parts[1]);
-    
-    // Parse hashes
     pieceHashes = split(parts[2], ',');
     
-    // Parse seeders
     vector<string> seederStrs = split(parts[3], ';');
     for (const string& seederStr : seederStrs) {
         if (seederStr.empty()) continue;
@@ -294,7 +329,6 @@ vector<SeederInfo> parseFileInfo(const string& response, long long& fileSize, ve
         sInfo.ipAddr = seederParts[1];
         sInfo.port = stoi(seederParts[2]);
         
-        // Parse bitmap
         string bitmap = seederParts[3];
         for (char c : bitmap) {
             sInfo.availablePieces.push_back(c == '1');
@@ -334,21 +368,17 @@ bool downloadPieceFromPeer(const string& ipAddr, int port, const string& groupId
         return false;
     }
 
-    // Request piece: GET_PIECE|groupId|fileName|pieceIndex
     string request = "GET_PIECE|" + groupId + "|" + fileName + "|" + to_string(pieceIndex) + "\n";
     send(peerSock, request.c_str(), request.size(), 0);
 
-    // Receive piece data
     char buffer[PIECE_SIZE];
     ssize_t totalReceived = 0;
     
-    // Set a timeout for receiving
     struct timeval tv;
-    tv.tv_sec = 10;  // 10 second timeout
+    tv.tv_sec = 10;
     tv.tv_usec = 0;
     setsockopt(peerSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
 
-    // Keep receiving until we have enough data or connection closes
     while (totalReceived < PIECE_SIZE) {
         ssize_t bytesReceived = recv(peerSock, buffer + totalReceived, PIECE_SIZE - totalReceived, 0);
         
@@ -358,13 +388,11 @@ bool downloadPieceFromPeer(const string& ipAddr, int port, const string& groupId
         }
         
         if (bytesReceived == 0) {
-            // Connection closed, we got all the data
             break;
         }
-        
+
         totalReceived += bytesReceived;
         
-        // Check if we received an error message (should be small and contain newline)
         if (totalReceived < 100) {
             for (ssize_t i = 0; i < totalReceived; i++) {
                 if (buffer[i] == '\n') {
@@ -381,7 +409,6 @@ bool downloadPieceFromPeer(const string& ipAddr, int port, const string& groupId
         return false;
     }
 
-    // Verify hash
     string actualHash = calculateSHA1(buffer, totalReceived);
     if (actualHash != expectedHash) {
         cout << "[DOWNLOAD] Hash mismatch for piece " << pieceIndex 
@@ -389,7 +416,6 @@ bool downloadPieceFromPeer(const string& ipAddr, int port, const string& groupId
         return false;
     }
 
-    // Write piece to file
     int fd = open(destPath.c_str(), O_WRONLY | O_CREAT, 0644);
     if (fd < 0) {
         return false;
@@ -402,10 +428,82 @@ bool downloadPieceFromPeer(const string& ipAddr, int port, const string& groupId
     return true;
 }
 
+void downloadWorker(int workerId, const vector<SeederInfo>& seeders, 
+                   const string& groupId, const string& fileName, 
+                   const string& destPath, TaskQueue& taskQueue,
+                   DownloadInfo* dInfo, atomic<int>& downloadedCount,
+                   atomic<int>& failedCount) {
+    
+    int seederIndex = workerId % seeders.size();
+    
+    while (true) {
+        DownloadTask task;
+        if (!taskQueue.pop(task)) {
+            break;
+        }
+        
+        bool downloaded = false;
+        int attempts = 0;
+        const int MAX_ATTEMPTS = 3;
+        
+        while (!downloaded && attempts < MAX_ATTEMPTS) {
+            for (size_t i = 0; i < seeders.size() && !downloaded; i++) {
+                int currentSeederIdx = (seederIndex + i) % seeders.size();
+                const SeederInfo& seeder = seeders[currentSeederIdx];
+                
+                if (task.pieceIndex < (int)seeder.availablePieces.size() && 
+                    seeder.availablePieces[task.pieceIndex]) {
+                    
+                    if (downloadPieceFromPeer(seeder.ipAddr, seeder.port, groupId, 
+                                             fileName, task.pieceIndex, destPath, 
+                                             task.expectedHash)) {
+                        downloaded = true;
+                        downloadedCount++;
+                        
+                        {
+                            lock_guard<mutex> lock(downloadMutex);
+                            dInfo->piecesDownloaded[task.pieceIndex] = true;
+                        }
+                        
+                        {
+                            lock_guard<mutex> lock(consoleMutex);
+                            cout << "[DOWNLOAD] Worker " << workerId 
+                                 << " downloaded piece " << task.pieceIndex + 1 
+                                 << "/" << dInfo->totalPieces 
+                                 << " from " << seeder.userId 
+                                 << " (" << seeder.ipAddr << ":" << seeder.port << ")" << endl;
+                        }
+                    }
+                }
+            }
+            
+            if (!downloaded) {
+                attempts++;
+                if (attempts < MAX_ATTEMPTS) {
+                    lock_guard<mutex> lock(consoleMutex);
+                    cout << "[DOWNLOAD] Worker " << workerId 
+                         << " retrying piece " << task.pieceIndex 
+                         << " (attempt " << attempts + 1 << ")" << endl;
+                    this_thread::sleep_for(chrono::milliseconds(100));
+                }
+            }
+        }
+        
+        if (!downloaded) {
+            failedCount++;
+            lock_guard<mutex> lock(consoleMutex);
+            cout << "[DOWNLOAD] Worker " << workerId 
+                 << " FAILED to download piece " << task.pieceIndex 
+                 << " after " << MAX_ATTEMPTS << " attempts" << endl;
+        }
+        
+        seederIndex = (seederIndex + 1) % seeders.size();
+    }
+}
+
 void downloadFileThread(string groupId, string fileName, string destPath) {
     string key = groupId + ":" + fileName;
     
-    // Get file info from tracker
     string cmd = "get_file_info " + groupId + " " + fileName;
     sendToTracker(cmd);
     
@@ -427,7 +525,6 @@ void downloadFileThread(string groupId, string fileName, string destPath) {
         return;
     }
 
-    // Initialize download info
     DownloadInfo dInfo;
     dInfo.groupId = groupId;
     dInfo.fileName = fileName;
@@ -445,41 +542,46 @@ void downloadFileThread(string groupId, string fileName, string destPath) {
 
     {
         lock_guard<mutex> lock(consoleMutex);
-        cout << "[DOWNLOAD] Starting download of " << fileName << " (" << dInfo.totalPieces << " pieces)\n";
+        cout << "[DOWNLOAD] Starting download of " << fileName 
+             << " (" << dInfo.totalPieces << " pieces)" << endl;
+        cout << "[DOWNLOAD] Available seeders: " << seeders.size() << endl;
     }
 
-    // Download pieces
-    int downloadedCount = 0;
-    for (int pieceIdx = 0; pieceIdx < dInfo.totalPieces; pieceIdx++) {
-        bool downloaded = false;
-        
-        // Try each seeder
-        for (const SeederInfo& seeder : seeders) {
-            if (pieceIdx < (int)seeder.availablePieces.size() && seeder.availablePieces[pieceIdx]) {
-                if (downloadPieceFromPeer(seeder.ipAddr, seeder.port, groupId, fileName, 
-                                         pieceIdx, destPath, pieceHashes[pieceIdx])) {
-                    downloaded = true;
-                    downloadedCount++;
-                    
-                    {
-                        lock_guard<mutex> lock(downloadMutex);
-                        activeDownloads[key].piecesDownloaded[pieceIdx] = true;
-                    }
-                    
-                    {
-                        lock_guard<mutex> lock(consoleMutex);
-                        cout << "[DOWNLOAD] Downloaded piece " << pieceIdx + 1 << "/" << dInfo.totalPieces 
-                             << " of " << fileName << endl;
-                    }
-                    
-                    break;
-                }
-            }
-        }
-        
-        if (!downloaded) {
-            lock_guard<mutex> lock(consoleMutex);
-            cout << "[DOWNLOAD] Failed to download piece " << pieceIdx << " from any seeder\n";
+    TaskQueue taskQueue;
+    for (int i = 0; i < dInfo.totalPieces; i++) {
+        DownloadTask task;
+        task.pieceIndex = i;
+        task.expectedHash = pieceHashes[i];
+        task.attemptCount = 0;
+        taskQueue.push(task);
+    }
+
+    int numWorkers = min((int)seeders.size(), dInfo.totalPieces);
+    vector<thread> workers;
+    atomic<int> downloadedCount(0);
+    atomic<int> failedCount(0);
+    
+    {
+        lock_guard<mutex> lock(consoleMutex);
+        cout << "[DOWNLOAD] Spawning " << numWorkers << " worker threads" << endl;
+    }
+
+    DownloadInfo* dInfoPtr = nullptr;
+    {
+        lock_guard<mutex> lock(downloadMutex);
+        dInfoPtr = &activeDownloads[key];
+    }
+
+    for (int i = 0; i < numWorkers; i++) {
+        workers.emplace_back(downloadWorker, i, ref(seeders), groupId, fileName, 
+                           destPath, ref(taskQueue), dInfoPtr, 
+                           ref(downloadedCount), ref(failedCount));
+    }
+
+    taskQueue.setDone();
+    for (auto& worker : workers) {
+        if (worker.joinable()) {
+            worker.join();
         }
     }
 
@@ -494,7 +596,6 @@ void downloadFileThread(string groupId, string fileName, string destPath) {
             cout << "[C] [" << groupId << "] " << fileName << endl;
         }
 
-        // Update tracker with our pieces
         string bitmap = "";
         for (bool b : dInfo.piecesDownloaded) {
             bitmap += (b ? "1" : "0");
@@ -504,8 +605,9 @@ void downloadFileThread(string groupId, string fileName, string destPath) {
         receiveFromTracker();
     } else {
         lock_guard<mutex> lock(consoleMutex);
-        cout << "[DOWNLOAD] Incomplete download of " << fileName << " (" << downloadedCount 
-             << "/" << dInfo.totalPieces << " pieces)\n";
+        cout << "[DOWNLOAD] Incomplete download of " << fileName 
+             << " (" << downloadedCount << "/" << dInfo.totalPieces 
+             << " pieces, " << failedCount << " failed)" << endl;
     }
 }
 
@@ -555,7 +657,6 @@ void handleStopShare(const vector<string>& tokens) {
     string response = receiveFromTracker();
     cout << response << endl;
 
-    // Remove from local tracking
     string key = tokens[1] + ":" + tokens[2];
     lock_guard<mutex> lock(downloadMutex);
     activeDownloads.erase(key);
@@ -581,7 +682,6 @@ void servePiece(int clientSock, const string& groupId, const string& fileName, i
         return;
     }
 
-    // Read piece from file
     int fd = open(dInfo.destPath.c_str(), O_RDONLY);
     if (fd < 0) {
         string error = "ERROR:Cannot open file\n";
@@ -596,7 +696,6 @@ void servePiece(int clientSock, const string& groupId, const string& fileName, i
     close(fd);
 
     if (bytesRead > 0) {
-        // Send the entire piece, handling partial sends
         ssize_t totalSent = 0;
         while (totalSent < bytesRead) {
             ssize_t sent = send(clientSock, buffer + totalSent, bytesRead - totalSent, 0);
@@ -623,12 +722,10 @@ void handlePeerClient(int clientSock) {
     buffer[bytes] = '\0';
     string request(buffer);
     
-    // Remove newline
     if (!request.empty() && request.back() == '\n') {
         request.pop_back();
     }
 
-    // Format: GET_PIECE|groupId|fileName|pieceIndex
     vector<string> parts = split(request, '|');
     if (parts.size() == 4 && parts[0] == "GET_PIECE") {
         string groupId = parts[1];
@@ -690,19 +787,15 @@ int main(int argc, char* argv[]) {
         vector<vector<string>> ports = getPortVector(filepath);
         string hostname = ports[0][0];
 
-        // Parse client IP and port
         vector<string> ipPortVector = split(clientIp_port, ':');
         myIpAddr = ipPortVector[0];
         myPort = stoi(ipPortVector[1]);
 
-        // Connect to tracker
         trackerSock = connectToTracker(hostname, ports);
 
-        // Start peer server
         thread peerServerThread(startPeerServer, myPort);
         peerServerThread.detach();
 
-        // Wait a bit for server to start
         this_thread::sleep_for(chrono::milliseconds(500));
 
         cout << "Client ready. Type commands (or 'exit' to quit)\n";
@@ -731,7 +824,6 @@ int main(int argc, char* argv[]) {
 
             string command = tokens[0];
 
-            // Handle file commands locally
             if (command == "upload_file") {
                 handleUploadFile(tokens);
             } else if (command == "list_files") {
@@ -743,7 +835,6 @@ int main(int argc, char* argv[]) {
             } else if (command == "stop_share") {
                 handleStopShare(tokens);
             } else if (command == "login" && tokens.size() == 3) {
-                // After login, register our address with tracker
                 sendToTracker(input);
                 string response = receiveFromTracker();
                 cout << response << endl;
@@ -755,7 +846,6 @@ int main(int argc, char* argv[]) {
                     receiveFromTracker();
                 }
             } else {
-                // Send other commands to tracker
                 sendToTracker(input);
                 string response = receiveFromTracker();
                 cout << response << endl;

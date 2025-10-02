@@ -30,17 +30,15 @@ void error(const char *msg)
     exit(1);
 }
 
-
-enum Tracker_role {PRIMARY,SECONDARY};
-vector<string>commandLog;
+enum Tracker_role {PRIMARY, SECONDARY};
+vector<string> commandLog;
 Tracker_role role;
 mutex state_mutex;
 int hbSockFd = -1;
 mutex hbSendMutex;
 bool peerAlive = true;
 
-////////////////////////////////////// STATE MANAGEMENT
-
+// STATE MANAGEMENT
 struct User
 {
     string userId;
@@ -73,14 +71,10 @@ unordered_map<string, User> users;
 unordered_map<string, Group> groups;
 unordered_map<int, string> sessionMap;
 unordered_map<string, unordered_map<string, FileInfo>> files;
-unordered_map<string, ClientInfo> clientAddresses; // userId -> ClientInfo
-////////////////////////////////////////////////
-
-
-
+unordered_map<string, ClientInfo> clientAddresses;
 
 void appendCommandLog(const string cmd){
-    lock_guard<mutex>lock(state_mutex);
+    lock_guard<mutex> lock(state_mutex);
     commandLog.push_back(cmd);
 }
 
@@ -95,8 +89,7 @@ void monitorPeer() {
     }
 }
 
-//////////////////////////////////////////////////////client command Executors 
-
+// CLIENT COMMAND EXECUTORS
 string getLoggedInUser(int clientSock) {
     if (sessionMap.find(clientSock) != sessionMap.end()) {
         return sessionMap[clientSock];
@@ -105,7 +98,7 @@ string getLoggedInUser(int clientSock) {
 }
 
 void sendResponse(int clientSock, const string& message) {
-    if(role==Tracker_role::PRIMARY){
+    if(role == Tracker_role::PRIMARY){
         string msg = message + "\n";
         send(clientSock, msg.c_str(), msg.size(), 0);
     }
@@ -121,7 +114,7 @@ void handleCreateUser(const string& userId, const string& password, int clientSo
     sendResponse(clientSock, "User created successfully");
 }
 
-void handleLogin(string userId,const string password, int clientSock) {
+void handleLogin(string userId, const string password, int clientSock) {
     if(!getLoggedInUser(clientSock).empty()){
         sendResponse(clientSock, "Logout current User before login.");
         return;
@@ -185,22 +178,22 @@ void handleLeaveGroup(const string& groupId, int clientSock){
         sendResponse(clientSock, "You must login first");
         return;
     }
-    if(groups.count(groupId)==0){
+    if(groups.count(groupId) == 0){
         sendResponse(clientSock, "Group Id doesn't exist");
         return;
     }
     Group &g = groups[groupId];
-    if(g.ownerId==userId){
+    if(g.ownerId == userId){
         sendResponse(clientSock, "you are the Owner of group. you cannot exit");
         return;
     }
-    if(g.members.count(userId)==0){
-        sendResponse(clientSock,"You are not a member of that group");
+    if(g.members.count(userId) == 0){
+        sendResponse(clientSock, "You are not a member of that group");
         return;
     }
     
     g.members.erase(userId);
-    sendResponse(clientSock,"Left the group with id: "+groupId);
+    sendResponse(clientSock, "Left the group with id: " + groupId);
 }
 
 void handleListGroups(int clientSock) {
@@ -209,7 +202,7 @@ void handleListGroups(int clientSock) {
         return;
     }
     string response = "Available groups:\n";
-    for (auto [groupName,groupData] : groups) {
+    for (auto [groupName, groupData] : groups) {
         response += groupName + " (Owner: " + groupData.ownerId + ")\n";
     }
 
@@ -235,7 +228,7 @@ void handleListRequests(const string& groupId, int clientSock) {
         sendResponse(clientSock, "No pending requests for group: " + groupId);
         return;
     }
-    string response =  "Pending join requests for " + groupId + ":\n";
+    string response = "Pending join requests for " + groupId + ":\n";
 
     for (auto &userRequested : g.joinRequests) {
         response += "- " + userRequested + "\n";
@@ -262,11 +255,11 @@ void handleAcceptRequest(const string groupId, const string& reqUserId, int clie
         return;
     }
     
-    auto it = find(g.joinRequests.begin(),g.joinRequests.end(),reqUserId);
+    auto it = find(g.joinRequests.begin(), g.joinRequests.end(), reqUserId);
     if (it != g.joinRequests.end()) {
         g.joinRequests.erase(it);
         g.members.insert(reqUserId);
-        sendResponse(clientSock, "Accepted join request. "+ reqUserId +" is now a member of group " + groupId);
+        sendResponse(clientSock, "Accepted join request. " + reqUserId + " is now a member of group " + groupId);
     } else {
         sendResponse(clientSock, "No join request from user " + reqUserId);
     }
@@ -275,13 +268,14 @@ void handleAcceptRequest(const string groupId, const string& reqUserId, int clie
 
 void handleLogout(int clientSock){
     string userId = sessionMap[clientSock];
-    users[userId].isLoggedin = false;
-    sessionMap.erase(clientSock);
+    if (!userId.empty()) {
+        users[userId].isLoggedin = false;
+        sessionMap.erase(clientSock);
+    }
     sendResponse(clientSock, "user LoggedOut");
 }
 
-// ==================== FILE MANAGEMENT FUNCTIONS ====================
-
+// FILE MANAGEMENT FUNCTIONS
 void handleUploadFile(const string& groupId, const string& fileName, const string& fileSize, 
                       const string& hashes, int clientSock) {
     string userId = getLoggedInUser(clientSock);
@@ -302,7 +296,7 @@ void handleUploadFile(const string& groupId, const string& fileName, const strin
     }
 
     long long fileSz = stoll(fileSize);
-    int numPieces = (fileSz + 524287) / 524288; // ceil(fileSize / 512KB)
+    int numPieces = (fileSz + 524287) / 524288;
     vector<bool> allPieces(numPieces, true);
 
     FileInfo fInfo;
@@ -373,7 +367,6 @@ void handleGetFileInfo(const string& groupId, const string& fileName, int client
 
     FileInfo &fInfo = files[groupId][fileName];
     
-    // Format: FILEINFO|filesize|hashes|seeder1:ip:port;seeder2:ip:port;...
     string response = "FILEINFO|" + to_string(fInfo.fileSize) + "|" + fInfo.combinedHashes + "|";
     
     bool first = true;
@@ -385,7 +378,6 @@ void handleGetFileInfo(const string& groupId, const string& fileName, int client
             ClientInfo &cInfo = clientAddresses[seederUserId];
             response += seederUserId + ":" + cInfo.ipAddr + ":" + to_string(cInfo.port) + ":";
             
-            // Add piece availability bitmap
             for (bool hasPiece : pieceMask) {
                 response += (hasPiece ? "1" : "0");
             }
@@ -436,7 +428,6 @@ void handleStopShare(const string& groupId, const string& fileName, int clientSo
     if (fInfo.seeders.count(userId) > 0) {
         fInfo.seeders.erase(userId);
         
-        // If no seeders left, remove the file entry
         if (fInfo.seeders.empty()) {
             files[groupId].erase(fileName);
         }
@@ -457,9 +448,8 @@ void handleRegisterClient(const string& userId, const string& ipAddr, const stri
     sendResponse(clientSock, "Client registered successfully");
 }
 
-// ==================== COMMAND EXECUTOR ====================
-
-void CommandExecutor(string input,int clientSock){
+// COMMAND EXECUTOR
+void CommandExecutor(string input, int clientSock){
     vector<string> tokens = split(input, ' ');
     
     if (tokens.empty()) {
@@ -469,36 +459,34 @@ void CommandExecutor(string input,int clientSock){
 
     string command = tokens[0];
     
-    if (command == "create_user" && tokens.size()== 3 ) {
+    if (command == "create_user" && tokens.size() == 3) {
         handleCreateUser(tokens[1], tokens[2], clientSock);
     }
     else if (command == "login" && tokens.size() == 3) {
         handleLogin(tokens[1], tokens[2], clientSock);
     }
-    else if (command == "create_group" &&  tokens.size() == 2) {
+    else if (command == "create_group" && tokens.size() == 2) {
         handleCreateGroup(tokens[1], clientSock);
     }
-    else if (command == "join_group" &&  tokens.size() == 2 ) {
+    else if (command == "join_group" && tokens.size() == 2) {
         handleJoinGroup(tokens[1], clientSock);
     }
-    else if (command == "leave_group" &&  tokens.size() == 2 ) {
+    else if (command == "leave_group" && tokens.size() == 2) {
         handleLeaveGroup(tokens[1], clientSock);
     }
-    else if (command == "list_groups" &&  tokens.size() == 1 ) {
-        handleListGroups( clientSock);
+    else if (command == "list_groups" && tokens.size() == 1) {
+        handleListGroups(clientSock);
     }
-    else if (command == "list_requests" &&  tokens.size() == 2 ) {
+    else if (command == "list_requests" && tokens.size() == 2) {
         handleListRequests(tokens[1], clientSock);
     }
-    else if (command == "accept_request" &&  tokens.size() == 3 ) {
-        handleAcceptRequest(tokens[1],tokens[2], clientSock);
+    else if (command == "accept_request" && tokens.size() == 3) {
+        handleAcceptRequest(tokens[1], tokens[2], clientSock);
     }
-    else if(command=="logout"){
+    else if (command == "logout") {
         handleLogout(clientSock);
     }
-    // FILE MANAGEMENT COMMANDS
     else if (command == "upload_file" && tokens.size() >= 5) {
-        // Format: upload_file <groupId> <fileName> <fileSize> <hashes>
         string hashes = "";
         for (size_t i = 4; i < tokens.size(); i++) {
             hashes += tokens[i];
@@ -522,13 +510,12 @@ void CommandExecutor(string input,int clientSock){
         handleRegisterClient(tokens[1], tokens[2], tokens[3], clientSock);
     }
     else {
-        cout<<"Unknown command"<<endl;
-        sendResponse(clientSock,"Unknown command");
+        cout << "Unknown command" << endl;
+        sendResponse(clientSock, "Unknown command");
     }
 }
 
-///////////////Heartbeat sender & reciever codes 
-
+// HEARTBEAT & REPLICATION
 void replicateCommand(const string &cmd) {
     lock_guard<mutex> lock(hbSendMutex);
     if (hbSockFd != -1) {
@@ -536,7 +523,6 @@ void replicateCommand(const string &cmd) {
         ssize_t totalSent = 0;
         ssize_t msgLen = msg.size();
         
-        // Send the entire message, handling partial sends
         while (totalSent < msgLen) {
             ssize_t sent = send(hbSockFd, msg.c_str() + totalSent, msgLen - totalSent, 0);
             if (sent <= 0) {
@@ -555,17 +541,17 @@ void replicateCommand(const string &cmd) {
 void heartBeat_Sender(const string &peerIp, int peer_port){
     try {
         while(true){
-            int sockFd = socket(AF_INET,SOCK_STREAM,0);
-            if(sockFd<0){
+            int sockFd = socket(AF_INET, SOCK_STREAM, 0);
+            if(sockFd < 0){
                 throw runtime_error("Failed to connect Reciever socket");
             }
         
             sockaddr_in peer_addr{};
             peer_addr.sin_family = AF_INET;
             peer_addr.sin_port = htons(peer_port);
-            inet_pton(AF_INET,peerIp.c_str(),&peer_addr.sin_addr);
+            inet_pton(AF_INET, peerIp.c_str(), &peer_addr.sin_addr);
             
-            if(connect(sockFd,(sockaddr*)&peer_addr,sizeof(peer_addr))==0){
+            if(connect(sockFd, (sockaddr*)&peer_addr, sizeof(peer_addr)) == 0){
                 {
                     lock_guard<mutex> lock(hbSendMutex);
                     hbSockFd = sockFd;
@@ -581,9 +567,9 @@ void heartBeat_Sender(const string &peerIp, int peer_port){
                 }
 
                 while (true) {
-                    string hb = "heartbeat destination :"+ to_string(peer_port)+"\n";
-                    if(send(sockFd,hb.c_str(),hb.size(),0)<=0){
-                        cout<<"[Sender] connection lost. will retry .."<<endl;
+                    string hb = "heartbeat destination :" + to_string(peer_port) + "\n";
+                    if(send(sockFd, hb.c_str(), hb.size(), 0) <= 0){
+                        cout << "[Sender] connection lost. will retry .." << endl;
                         break;
                     }
                     this_thread::sleep_for(chrono::seconds(1));
@@ -604,8 +590,8 @@ void heartBeat_Sender(const string &peerIp, int peer_port){
 
 void heartBeatRecv(int listen_port){
     try {
-        int serverFd = socket(AF_INET,SOCK_STREAM,0);
-        if(serverFd<0){
+        int serverFd = socket(AF_INET, SOCK_STREAM, 0);
+        if(serverFd < 0){
             throw runtime_error("Unable to open connect to sender");
         }
         sockaddr_in serv_addr{};
@@ -614,29 +600,28 @@ void heartBeatRecv(int listen_port){
         serv_addr.sin_port = htons(listen_port);
         int opt = 1;
 
-        setsockopt(serverFd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
-        if(bind(serverFd,(sockaddr*)&serv_addr,sizeof(serv_addr))<0){
+        setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        if(bind(serverFd, (sockaddr*)&serv_addr, sizeof(serv_addr)) < 0){
             throw runtime_error("bind");
         }
-        listen(serverFd,5);
-        cout<<"[Reciver] listening for hearbeats on port  :"<<listen_port<<endl;
+        listen(serverFd, 5);
+        cout << "[Reciver] listening for hearbeats on port  :" << listen_port << endl;
 
         while(true && peerAlive){
             sockaddr_in client_addr{};
             socklen_t len = sizeof(client_addr);
 
-            int clientFd = accept(serverFd,(sockaddr *)&client_addr,&len);
-            if(clientFd<=0){
+            int clientFd = accept(serverFd, (sockaddr *)&client_addr, &len);
+            if(clientFd <= 0){
                 perror("unable to recieve");
                 continue;
             }
-            cout<<"[Reciever] Peer connected\n";
+            cout << "[Reciever] Peer connected\n";
 
             char buffer[4096];
             string partial;
-            auto last_rev = chrono::steady_clock::now();
             while (true) {
-                ssize_t bytes = recv(clientFd, buffer, sizeof(buffer)-1, 0);
+                ssize_t bytes = recv(clientFd, buffer, sizeof(buffer) - 1, 0);
                 if (bytes <= 0) {
                     peerAlive = false;
                     cout << "[Receiver] Lost connection to peer\n";
@@ -662,7 +647,7 @@ void heartBeatRecv(int listen_port){
                         } else {
                             lock_guard<mutex> lock(state_mutex);
                             commandLog.push_back(cmd);
-                            CommandExecutor(cmd,-1);
+                            CommandExecutor(cmd, -1);
                             cout << "[Receiver] Synced cmd: " << cmd.substr(0, 50);
                             if(cmd.length() > 50) cout << "... (truncated)";
                             cout << endl;
@@ -683,23 +668,20 @@ void handleClient(int clientSock_fd, sockaddr_in clientSocAddr){
         
         while(1){
             char buffer[4096];
-            ssize_t bytes = recv(clientSock_fd, buffer, sizeof(buffer)-1, 0);
+            ssize_t bytes = recv(clientSock_fd, buffer, sizeof(buffer) - 1, 0);
             if(bytes <= 0){
                 perror("client connection failed");
                 break;
             }
             buffer[bytes] = '\0';
             
-            // Append to partial buffer
             partialBuffer.append(buffer, bytes);
             
-            // Process all complete commands (ending with newline)
             size_t pos;
             while ((pos = partialBuffer.find('\n')) != string::npos) {
                 string cmd = partialBuffer.substr(0, pos);
                 partialBuffer.erase(0, pos + 1);
                 
-                // Remove trailing carriage returns
                 while (!cmd.empty() && (cmd.back() == '\r')) {
                     cmd.pop_back();
                 }
@@ -709,14 +691,14 @@ void handleClient(int clientSock_fd, sockaddr_in clientSocAddr){
                 if(role == Tracker_role::PRIMARY){
                     appendCommandLog(cmd);
             
-                    cout<<"[Primary] logged & Serving client request : "<<cmd.substr(0, 100);
+                    cout << "[Primary] logged & Serving client request : " << cmd.substr(0, 100);
                     if(cmd.length() > 100) cout << "... (truncated)";
                     cout << endl;
                     
                     CommandExecutor(cmd, clientSock_fd);
                     replicateCommand(cmd);
                 } else {
-                    cout<<"[secondary] Ignoring client request"<<endl;
+                    cout << "[secondary] Ignoring client request" << endl;
                 }
             }
         }
@@ -730,50 +712,50 @@ void handleClient(int clientSock_fd, sockaddr_in clientSocAddr){
 int main(int argc, char *argv[])
 {
     try {
-        signal(SIGPIPE,SIG_IGN);
-        if(argc!=3){
+        signal(SIGPIPE, SIG_IGN);
+        if(argc != 3){
             throw runtime_error("Incorrect args");
         }
         string filepath = argv[1];
         
-        vector<vector<string>>ports  = getPortVector(filepath);
+        vector<vector<string>> ports = getPortVector(filepath);
         
         int trackerNo = stoi(argv[2]);
         trackerNo--;
 
         vector<string> myIpPort = ports[trackerNo];
-        vector<string> peerIpPort = ports[(trackerNo+1)%2];
-        int port =stoi( myIpPort[1]);
-        int peerPort =stoi( peerIpPort[1]);
+        vector<string> peerIpPort = ports[(trackerNo + 1) % 2];
+        int port = stoi(myIpPort[1]);
+        int peerPort = stoi(peerIpPort[1]);
         
-        cout<<"Myport "<<port<<" ,peerport: "<<peerPort<<endl;
+        cout << "Myport " << port << " ,peerport: " << peerPort << endl;
 
         string ipaddr = ports[trackerNo][0];
-        role = (trackerNo==0? Tracker_role::PRIMARY : Tracker_role::SECONDARY);
+        role = (trackerNo == 0 ? Tracker_role::PRIMARY : Tracker_role::SECONDARY);
 
         cout << "Tracker running on port " << port << " Role: " << ((role == Tracker_role::PRIMARY) ? "PRIMARY" : "SECONDARY") << endl;
 
         int sock_fd;
-        sock_fd= socket(AF_INET,SOCK_STREAM,0);
-        if(sock_fd==-1){
+        sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if(sock_fd == -1){
             perror("Unable to create socket fd");
         }
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port);
         addr.sin_addr.s_addr = INADDR_ANY;
-        int opt =1;
+        int opt = 1;
         setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        bind(sock_fd,(sockaddr * )&addr,sizeof(addr));  
+        bind(sock_fd, (sockaddr *)&addr, sizeof(addr));  
         listen(sock_fd, SOMAXCONN);
 
-        cout << "Tracker running on "<<port<<" ...\n";
+        cout << "Tracker running on " << port << " ...\n";
 
         thread hb_thread;
-        if(role==Tracker_role::PRIMARY){
-            hb_thread =  thread(heartBeat_Sender, peerIpPort[0],peerPort+100);
+        if(role == Tracker_role::PRIMARY){
+            hb_thread = thread(heartBeat_Sender, peerIpPort[0], peerPort + 100);
         }else{
-            hb_thread =   thread(heartBeatRecv, port + 100);
+            hb_thread = thread(heartBeatRecv, port + 100);
         }
         hb_thread.detach();
 
@@ -783,11 +765,11 @@ int main(int argc, char *argv[])
         while(true){
             sockaddr_in clientSockAddr;
             socklen_t len = sizeof(clientSockAddr);
-            int newSocket_fd = accept(sock_fd,(sockaddr*)&clientSockAddr,&len);
-            if(newSocket_fd<=0){
+            int newSocket_fd = accept(sock_fd, (sockaddr*)&clientSockAddr, &len);
+            if(newSocket_fd <= 0){
                 this_thread::sleep_for(chrono::milliseconds(100));
             }else{
-                thread(handleClient,newSocket_fd,clientSockAddr).detach();
+                thread(handleClient, newSocket_fd, clientSockAddr).detach();
             }   
         }
     }
